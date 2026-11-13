@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+data/
+model.joblib
+paper_log.db
+training_report.txt
+*.pyc
+*.db-journal
+*.db-wal
+*.db-shm
+*.log
+.claude/
