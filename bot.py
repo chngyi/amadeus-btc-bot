@@ -20,12 +20,14 @@ from telegram.ext import (Application, CommandHandler, ContextTypes, MessageHand
 import explain
 import hyperliquid as hl
 import liqmap
+import market
 import news
 import paper_log as pl
+import report
 import requests
 
 import whales
-from config import (ALLOWED_CHAT_ID, ANTHROPIC_API_KEY, BOT_NAME, DISPLAY_TZ, FEE_ROUND_TRIP, FIXED_LEVERAGE, HORIZON_H,
+from config import (ALLOWED_CHAT_ID, ANTHROPIC_API_KEY, BOT_NAME, BRIEF_HOUR, DISPLAY_TZ, FEE_ROUND_TRIP, FIXED_LEVERAGE, HORIZON_H,
                     HEARTBEAT_URL, HL_PING_ALT_USD, HL_PING_USD, MIN_NOTIONAL, MODEL_PATH, REPORT_PATH, START_EQUITY, TELEGRAM_TOKEN)
 from data import btc_5m_since, funding_since
 from signal_engine import compute_signal, format_signal, levels_for, load_model
@@ -39,6 +41,10 @@ NEWS_PATTERN = re.compile(r"\b(news|headlines?|happening|war|oil|fed|cpi)\b", re
 STATUS_PATTERN = re.compile(r"\b(status|alive|are you (there|up|on|awake))\b", re.I)
 WHALE_PATTERN = re.compile(r"\b(whales?|liquidations?|walls?|spoof\w*|order ?books?|liquidity|clusters?|depth)\b", re.I)
 MAP_PATTERN = re.compile(r"\b(heat ?map|liq\w* ?map)\b", re.I)
+MARKET_PATTERN = re.compile(r"\b(market (snapshot|overview|update|brief\w*)|snapshot|briefing|positioning|open interest|funding"
+                            r"|options?|implied vol\w*|skew|max pain|(key|price) levels|support|resistance|coinbase premium"
+                            r"|stablecoins?|dominance)\b", re.I)
+REPORT_PATTERN = re.compile(r"\b(report card|weekly (report|summary|review)|how (did|have) you (do|done))\b", re.I)
 HL_PATTERN = re.compile(r"\b(hyperliquid|hl|top (traders?|wallets?|20)|smart money|copy ?(trad\w*|wallet))\b", re.I)
 WALLET_PATTERN = re.compile(r"\b(wallet|balance|money (left|do you have)|how much (money|cash|have you))\b", re.I)
 # "ping me if...", "alert me when...", "notify me", "let me know if..." - asking for pings, not for a call now.
@@ -165,6 +171,9 @@ HELP = (f"I'm {BOT_NAME}. I tell you how much BTC is likely to move in the next 
         "/whales on|off\n"
         "/hl - the Hyperliquid top 20 traders: what they hold, and the three wallets that copy them; /hl on|off\n"
         "/heatmap - a picture of where the 1,000 biggest Hyperliquid accounts' BTC positions get liquidated\n"
+        "/market - the wider picture: futures positioning and funding, what options price in, liquidations, "
+        "key levels, what's coming up. I send it once a day too; /market on|off\n"
+        "/report - my weekly report card: uptime, forecast accuracy, the four wallets\n"
         "/model - how the model did in its backtest\n"
         "/retrain - refresh the model with the latest data (~2-5 min)\n\n"
         "Every hour I quietly paper-trade my direction lean and log my volatility forecast, "
@@ -240,7 +249,8 @@ def _news_scorer_status(now: datetime) -> str:
 
 
 JOB_LABELS = {"hourly_scan": "Hourly scan", "resolve_job": "Trade/forecast checker", "news_job": "News reader",
-              "whale_job": "Whale watch", "hl_job": "Hyperliquid watch", "hl_refresh_job": "Hyperliquid leaderboard", "liqmap_job": "Liquidation map"}
+              "whale_job": "Whale watch", "hl_job": "Hyperliquid watch", "hl_refresh_job": "Hyperliquid leaderboard", "liqmap_job": "Liquidation map",
+              "market_job": "Market snapshot log", "brief_job": "Daily briefing / weekly report"}
 if HEARTBEAT_URL:
     JOB_LABELS["heartbeat_job"] = "Heartbeat"
 
@@ -336,6 +346,8 @@ def alerts_text() -> str:
              f"Also when the mirror wallet switches between long, short and flat. "
              f"Context, not a signal: copying them is being tested by three paper wallets. "
              f"[{onoff(pl.get_kv('hl', 'on') == 'on')}]",
+             f"📊 Daily market briefing - /market once a day, the first time I'm running after {BRIEF_HOUR:02d}:00, "
+             f"and my report card once a week. Description, not a signal. [{onoff(pl.get_kv('brief', 'on') == 'on')}]",
              "⚠ If my hourly scan keeps failing. [always on]", ""]
     try:
         art = model()
@@ -448,6 +460,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_wallet(update, ctx)
     elif WHALE_PATTERN.search(text) and not re.search(r"\b(why|long or short|should i)\b", text, re.I):
         await cmd_whales(update, ctx)
+    elif REPORT_PATTERN.search(text) and not re.search(r"\b(why|long or short|should i)\b", text, re.I):
+        await cmd_report(update, ctx)
+    elif MARKET_PATTERN.search(text) and not re.search(r"\b(why|long or short|should i)\b", text, re.I):
+        await cmd_market(update, ctx)
     elif ALERT_REQ_PATTERN.search(text) and not re.search(r"\b(should i|long or short)\b", text, re.I):
         await update.message.reply_text(alerts_text())
     elif explain.WHY_PATTERN.search(text) and not re.search(r"\b(should|long or short)\b", text, re.I):
@@ -751,6 +767,71 @@ async def hl_refresh_job(ctx: ContextTypes.DEFAULT_TYPE):
             await _send(ctx, text)
 
 
+async def market_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Hourly: logs one market snapshot row for later tests. Never pings."""
+    try:
+        snap = await asyncio.to_thread(market.collect)
+        if not snap["px"]:
+            raise RuntimeError("no price: " + "; ".join(sorted(set(snap["errors"].values())))[:200])
+        await asyncio.to_thread(market.log_snap, snap)
+        _job_ok("market_job")
+    except Exception as e:
+        if _job_failed("market_job", e) == 1:
+            log.warning("market snapshot failed: %s", e)
+
+
+async def cmd_market(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+    if ctx.args and ctx.args[0].lower() in ("on", "off"):
+        pl.set_kv("brief", ctx.args[0].lower())
+        await update.effective_message.reply_text(
+            f"Daily briefing and weekly report card: {ctx.args[0].upper()}. /market still works any time.")
+        return
+    msg = await update.effective_message.reply_text("Reading the market (a few seconds)...")
+    try:
+        snap = await asyncio.to_thread(market.collect)
+        await msg.edit_text(market.text(snap, ZoneInfo(DISPLAY_TZ))[:4096])
+    except Exception as e:
+        log.exception("market snapshot failed")
+        await msg.edit_text(f"Couldn't put the snapshot together: {e}")
+
+
+async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+    try:
+        await update.effective_message.reply_text(await asyncio.to_thread(report.text, ZoneInfo(DISPLAY_TZ)))
+    except Exception as e:
+        log.exception("report failed")
+        await update.effective_message.reply_text(f"Couldn't write the report: {e}")
+
+
+async def brief_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Every 10 min: sends the daily briefing the first time she's running at or after BRIEF_HOUR
+    (so a morning she slept through still gets one when she wakes), and the report card the first
+    time in a new week. kv `brief_day` / `report_week` remember what was sent."""
+    if pl.get_kv("brief", "on") != "on":
+        return
+    tz = ZoneInfo(DISPLAY_TZ)
+    local = datetime.now(tz)
+    try:
+        if local.hour >= BRIEF_HOUR and pl.get_kv("brief_day") != f"{local:%Y-%m-%d}":
+            snap = await asyncio.to_thread(market.collect)
+            if not snap["px"]:
+                raise RuntimeError("no price: " + "; ".join(sorted(set(snap["errors"].values())))[:200])
+            await _send(ctx, market.text(snap, tz, title="Daily briefing"))
+            pl.set_kv("brief_day", f"{local:%Y-%m-%d}")
+        week = f"{local:%G-W%V}"   # ISO week, starts Monday
+        if (local.weekday(), local.hour) >= (0, BRIEF_HOUR) and pl.get_kv("report_week") != week:
+            await _send(ctx, await asyncio.to_thread(report.text, tz))
+            pl.set_kv("report_week", week)
+        _job_ok("brief_job")
+    except Exception as e:
+        if _job_failed("brief_job", e) == 1:
+            log.warning("briefing failed: %s", e)
+
+
 async def heartbeat_job(ctx: ContextTypes.DEFAULT_TYPE):
     """Dead-man's switch: tells HEARTBEAT_URL she's alive. The pings stopping is the alert,
     so a failed ping is only logged (once per outage), never sent to Telegram."""
@@ -832,6 +913,9 @@ async def on_startup(app: Application):
     app.job_queue.run_repeating(hl_refresh_job, interval=3600, first=15)
     app.job_queue.run_repeating(hl_job, interval=60, first=(nxt_min - now).total_seconds() + 30)
     app.job_queue.run_repeating(liqmap_job, interval=60, first=(nxt_min - now).total_seconds() + 45)
+    # Market snapshot: logged 3 min after each hour; the briefing check waits 2 min so the liquidation feed has data.
+    app.job_queue.run_repeating(market_job, interval=3600, first=(nxt - now).total_seconds() + 90)
+    app.job_queue.run_repeating(brief_job, interval=600, first=120)
     if HEARTBEAT_URL:
         app.job_queue.run_repeating(heartbeat_job, interval=60, first=5)
     try:
@@ -869,6 +953,8 @@ def main():
     app.add_handler(CommandHandler(["whales", "whale"], cmd_whales))
     app.add_handler(CommandHandler(["hl", "hyperliquid", "top", "copy"], cmd_hl))
     app.add_handler(CommandHandler(["heatmap", "liqmap", "map"], cmd_heatmap))
+    app.add_handler(CommandHandler(["market", "snapshot", "brief"], cmd_market))
+    app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("retrain", cmd_retrain))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("%s running. Ctrl+C to stop.", BOT_NAME)

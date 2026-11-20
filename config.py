@@ -29,6 +29,7 @@ DISPLAY_TZ = os.getenv("DISPLAY_TZ", "Asia/Tokyo")  # times in messages
 # Dead-man's switch: she opens this URL every minute (e.g. a free healthchecks.io check), which
 # alerts you when the pings stop. Only the request itself is sent, no data. Empty = off.
 HEARTBEAT_URL = os.getenv("HEARTBEAT_URL", "")
+BRIEF_HOUR = int(os.getenv("BRIEF_HOUR", "8"))   # daily market briefing: first chance at or after this hour, DISPLAY_TZ
 
 # --- News (optional: Claude rates headlines; without a key, keyword rules do) ---
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")

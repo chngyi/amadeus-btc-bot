@@ -49,10 +49,11 @@ DEPTH_SCHEMA = """CREATE TABLE IF NOT EXISTS whale_depth (
 state: dict = {"net_15m": None, "price": None, "venues": {}, "depth": None}   # venues: name -> last error, or None if OK
 _walls: dict = {}                       # (venue, side, band) -> {"first", "usd", "max", "alerted"}
 _liqs: deque = deque(maxlen=20000)      # (time, side, usd) - side "long" = a long was force-sold
+_liqs_all: deque = deque(maxlen=100000) # (time, coin, side, usd): every Binance future, for /market (never pinged)
 _wall_pings: deque = deque(maxlen=50)   # times of new-wall pings, for WALL_MAX_PER_HOUR
 # last = when the newest liquidation on any coin arrived. error is only cleared by a message, not by
 # connecting, because a dead endpoint connects fine.
-feed: dict = {"connected": False, "since": None, "error": None, "last": None}
+feed: dict = {"connected": False, "since": None, "error": None, "last": None, "started": None}   # started: first connect
 
 
 def _now() -> datetime:
@@ -103,10 +104,14 @@ def check_burst(net: pd.Series, px: pd.DataFrame) -> dict | None:
 # --------------------------------------------------------------------------
 
 def on_liquidation(o: dict) -> None:
-    if o.get("s") != "BTCUSDT":
-        return
-    side = "long" if o["S"] == "SELL" else "short"   # a liquidated long is force-SOLD
-    _liqs.append((datetime.fromtimestamp(o["T"] / 1000, timezone.utc), side, float(o["ap"]) * float(o["z"])))
+    try:
+        side = "long" if o["S"] == "SELL" else "short"   # a liquidated long is force-SOLD
+        t, usd = datetime.fromtimestamp(o["T"] / 1000, timezone.utc), float(o["ap"]) * float(o["z"])
+    except (KeyError, TypeError, ValueError):
+        return   # one odd message mustn't drop the connection
+    _liqs_all.append((t, o.get("s", "?"), side, usd))
+    if o.get("s") == "BTCUSDT":
+        _liqs.append((t, side, usd))
 
 
 async def liquidation_listener() -> None:
@@ -119,7 +124,7 @@ async def liquidation_listener() -> None:
     while True:
         try:
             async with websockets.connect(LIQ_URL, open_timeout=15, ping_interval=60) as ws:
-                feed.update(connected=True, since=_now())
+                feed.update(connected=True, since=_now(), started=feed["started"] or _now())
                 backoff = 5
                 while True:
                     o = json.loads(await asyncio.wait_for(ws.recv(), LIQ_SILENT_MIN * 60)).get("o")
@@ -161,6 +166,21 @@ def liq_totals(minutes: float, now: datetime | None = None) -> dict:
     for t, side, usd in list(_liqs):     # copy: the listener appends from the event loop
         if t >= cutoff:
             out[side] += usd
+    return out
+
+
+def liq_market(minutes: float, now: datetime | None = None, top: int = 3) -> dict:
+    """Liquidations on every Binance future in the last `minutes`: $ of longs and shorts, and the
+    coins with the most. Same one-a-second-per-coin cap as BTC, so a lower bound."""
+    cutoff = (now or _now()) - timedelta(minutes=minutes)
+    out = {"long": 0.0, "short": 0.0}
+    coins: dict = {}
+    for t, sym, side, usd in list(_liqs_all):
+        if t >= cutoff:
+            out[side] += usd
+            coin = sym[:-4] if sym.endswith(("USDT", "USDC")) else sym
+            coins[coin] = coins.get(coin, 0.0) + usd
+    out["top"] = sorted(coins.items(), key=lambda kv: -kv[1])[:top]
     return out
 
 
