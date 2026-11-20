@@ -35,7 +35,11 @@ WALL_MAX_PER_HOUR = 3     # new-wall pings per hour; more wait their turn (the t
 CLUSTER_BAND = 100.0      # $ price band liquidity clusters are added up over, across the spot books
 CLUSTER_N = 3             # clusters shown per side
 DEPTH_STALE_MIN = 5       # a book reading older than this is not shown
-LIQ_URL = "wss://fstream.binance.com/ws/!forceOrder@arr"
+# Liquidations on every Binance USD-M future. The older /ws/ path (without /market) still accepts
+# the connection but sends nothing - found dead on 2026-11-20, hence the silence check below.
+LIQ_URL = "wss://fstream.binance.com/market/ws/!forceOrder@arr"
+LIQ_SILENT_MIN = 15       # no liquidation on ANY coin for this long = the feed is treated as dead (a guess:
+                          # on 2026-11-20 it carried ~16 a minute; a false alarm only costs a reconnect)
 
 SCHEMA = """CREATE TABLE IF NOT EXISTS whale_events (
     t TEXT, kind TEXT, side TEXT, usd REAL, price REAL, detail TEXT)"""
@@ -46,7 +50,9 @@ state: dict = {"net_15m": None, "price": None, "venues": {}, "depth": None}   # 
 _walls: dict = {}                       # (venue, side, band) -> {"first", "usd", "max", "alerted"}
 _liqs: deque = deque(maxlen=20000)      # (time, side, usd) - side "long" = a long was force-sold
 _wall_pings: deque = deque(maxlen=50)   # times of new-wall pings, for WALL_MAX_PER_HOUR
-feed: dict = {"connected": False, "since": None, "error": None}
+# last = when the newest liquidation on any coin arrived. error is only cleared by a message, not by
+# connecting, because a dead endpoint connects fine.
+feed: dict = {"connected": False, "since": None, "error": None, "last": None}
 
 
 def _now() -> datetime:
@@ -105,25 +111,48 @@ def on_liquidation(o: dict) -> None:
 
 async def liquidation_listener() -> None:
     """Runs for the bot's lifetime. Binance sends at most one liquidation per second per
-    symbol, so totals are a lower bound in a real cascade."""
+    symbol, so totals are a lower bound in a real cascade. A connection that stays open but
+    sends nothing for LIQ_SILENT_MIN is dropped and retried, and shown as a problem until
+    a message arrives (`feed_text`)."""
     import websockets
     backoff = 5
     while True:
         try:
             async with websockets.connect(LIQ_URL, open_timeout=15, ping_interval=60) as ws:
-                feed.update(connected=True, since=_now(), error=None)
+                feed.update(connected=True, since=_now())
                 backoff = 5
-                async for raw in ws:
-                    on_liquidation(json.loads(raw)["o"])
-            feed["error"] = "closed by Binance"
+                while True:
+                    o = json.loads(await asyncio.wait_for(ws.recv(), LIQ_SILENT_MIN * 60)).get("o")
+                    if o:
+                        feed.update(last=_now(), error=None)
+                        on_liquidation(o)
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            feed["error"] = f"connected but sent nothing for {LIQ_SILENT_MIN} min"
+            log.warning("liquidation feed: %s (reconnecting)", feed["error"])
+        except websockets.ConnectionClosedOK:
+            feed["error"] = "closed by Binance"
         except Exception as e:
             feed["error"] = f"{type(e).__name__}: {e}"[:150]
             log.warning("liquidation feed: %s (retry in %ss)", feed["error"], backoff)
         feed["connected"] = False
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 300)
+
+
+def feed_text(now: datetime | None = None) -> tuple[bool, str]:
+    """(working?, one phrase) for /status and /whales. Working means a liquidation arrived recently,
+    not merely that the socket is open."""
+    now = now or _now()
+    mins = lambda t: int((now - t).total_seconds() // 60)
+    if not feed["connected"]:
+        return False, f"down ({feed['error'] or 'not started'})"
+    if feed["error"]:
+        return False, f"{feed['error']}; reconnected {mins(feed['since'])} min ago, still nothing"
+    if not feed["last"]:
+        return True, f"connected {mins(feed['since'])} min, nothing received yet"
+    return True, f"connected {mins(feed['since'])} min, last liquidation on any coin {mins(feed['last'])} min ago"
 
 
 def liq_totals(minutes: float, now: datetime | None = None) -> dict:
@@ -458,10 +487,8 @@ def status_text(on: bool, tz) -> str:
     lines.append(f"• Market buy/sell bursts on Binance: {_m(WHALE_BURST_USD)}+ net in {WINDOW_MIN} min (perp + spot)."
                  + (f" Last 15 min: {'+' if net >= 0 else '-'}{_m(net)}." if net is not None else ""))
     h = liq_totals(60, now)
-    if feed["connected"]:
-        conn = f"live feed connected {int((now - feed['since']).total_seconds() // 60)} min"
-    else:
-        conn = f"⚠ live feed down ({feed['error'] or 'not started'})"
+    ok, txt = feed_text(now)
+    conn = ("" if ok else "⚠ ") + "live feed " + txt
     lines.append(f"• Liquidations on Binance: {_m(WHALE_LIQ_USD)}+ of longs or shorts in {WINDOW_MIN} min. "
                  f"Last hour: longs {_m(h['long'])}, shorts {_m(h['short'])}. {conn}.")
     watching = sorted(_walls.items(), key=lambda kv: -kv[1]["usd"])[:4]

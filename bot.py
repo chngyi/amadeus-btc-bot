@@ -301,8 +301,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Vol forecasts: {c['vol_logged']} logged, {c['vol_checked']} checked{vol_last}.")
     lines.append(f"Alerts: {pl.get_kv('alerts', 'on').upper()} · Breaking news: {pl.get_kv('breaking', 'on').upper()}")
     lines.append("News scorer: " + _news_scorer_status(now))
-    lines.append("Liquidation feed: " + (f"connected {_dur(now - whales.feed['since'])}" if whales.feed["connected"]
-                                         else f"⚠ down ({whales.feed['error'] or 'not started'})"))
+    feed_ok, feed_txt = whales.feed_text(now)
+    lines.append("Liquidation feed: " + ("" if feed_ok else "⚠ ") + feed_txt)
     t = hl.top_refreshed()
     lines.append(f"Hyperliquid: tracking {len(hl.top())}" + (f" (list refreshed {_dur(now - t)} ago)" if t else
                                                              " - ⚠ list not loaded yet")
